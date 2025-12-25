@@ -1,0 +1,663 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Holographic Christmas Tree • Particle 3D</title>
+  <style>
+    :root{
+      --gold:#d9b65a;
+      --fg:rgba(255,255,255,.88);
+      --glass:rgba(10,12,16,.35);
+      --stroke:rgba(255,255,255,.12);
+    }
+    html,body{height:100%;margin:0}
+    body{
+      overflow:hidden;
+      background: radial-gradient(circle at 50% 35%, #14263a 0%, #070a10 35%, #000 100%);
+      font-family: -apple-system, BlinkMacSystemFont, "PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+      touch-action:none;
+      user-select:none;
+    }
+    canvas{
+      position:fixed; inset:0;
+      width:100vw; height:100vh;
+      display:block;
+    }
+    /* UI */
+    .ui{
+      position:fixed; left:0; right:0; bottom:5%;
+      display:flex; justify-content:center;
+      pointer-events:none;
+      z-index:10;
+      padding:0 14px;
+    }
+    .card{
+      pointer-events:auto;
+      width:min(440px, 92vw);
+      background: var(--glass);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--stroke);
+      border-top-color: rgba(255,255,255,.28);
+      border-radius:22px;
+      padding:22px 22px 18px;
+      box-shadow: 0 24px 70px rgba(0,0,0,.55);
+      transform: translateY(22px);
+      opacity:0;
+      animation: up 1.35s cubic-bezier(.2,.8,.2,1) .6s forwards;
+    }
+    .card h1{
+      margin:0 0 10px;
+      font-size: 14px;
+      letter-spacing: .22em;
+      text-transform: uppercase;
+      font-weight: 500;
+      color: var(--gold);
+    }
+    .card p{
+      margin:0;
+      line-height:1.85;
+      font-size: 14px;
+      color: var(--fg);
+      font-weight: 300;
+    }
+    .hint{
+      margin-top: 12px;
+      font-size: 12px;
+      color: rgba(255,255,255,.35);
+    }
+    @keyframes up{to{transform:translateY(0);opacity:1}}
+
+    /* subtle film grain + scanlines overlay */
+    .overlay{
+      position:fixed; inset:0;
+      pointer-events:none;
+      background:
+        repeating-linear-gradient(
+          to bottom,
+          rgba(255,255,255,.035) 0px,
+          rgba(255,255,255,.035) 1px,
+          rgba(0,0,0,0) 2px,
+          rgba(0,0,0,0) 6px
+        );
+      mix-blend-mode: overlay;
+      opacity:.22;
+      z-index:6;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div class="overlay"></div>
+
+  <div class="ui">
+    <div class="card">
+      <h1>Merry Christmas! 🎄</h1>
+      <p>
+        To: 亲爱的Tata<br>
+        收到你的卡片了，你也像个星星一样blingbling。<br>
+        和你呆在一起的时间都很开心。<br>
+        谢谢你画的“茄子袜”和迷你日历，真可爱！<br>
+      </p>
+      <div class="hint">圣诞树可以用手指或者鼠标缩放</div>
+    </div>
+  </div>
+
+    <!-- 添加背景音乐 -->
+  <audio id="background-music" autoplay loop>
+    <source src="https://ldincredible.github.io/Tata_tree/music/christmas-438153.mp3" type="audio/mp3">
+    您的浏览器不支持音频元素。
+  </audio>
+
+<script>
+(() => {
+  // ==========
+  // Holographic 3D Particle Tree (single-file)
+  // 重点：3D 投影 + 分层合成（base + bloom glow）+ additive lights + 深度排序
+  // ==========
+
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha: true, desynchronized: true });
+
+  // Glow pass：用更低分辨率的离屏画布做 bloom（更快）
+  const glowCanvas = document.createElement('canvas');
+  const gctx = glowCanvas.getContext('2d', { alpha: true, desynchronized: true });
+
+  // Device pixel ratio（限制最大以保证性能）
+  let DPR = 1, W = 0, H = 0, CW = 0, CH = 0, GW = 0, GH = 0, Gscale = 0.33;
+
+  // Camera / interaction
+  let yaw = 0.4, pitch = -0.12;
+  let yawVel = 0.0022, pitchVel = 0;
+  let dragging = false;
+  let lastX = 0, lastY = 0;
+  let inertia = 0.92;
+  let zoom = 1.0; // 0.75 ~ 1.35
+
+  // Perf knobs
+  const COUNT_TREE = 1900;
+  const COUNT_LIGHTS = 220;
+  const COUNT_SNOW = 420;
+  const COUNT_BG_STARS = 260;
+
+  // Typed arrays for particles
+  // types: 0 tree, 1 light, 2 snow, 3 starTop, 4 bgStar
+  const total = COUNT_TREE + COUNT_LIGHTS + COUNT_SNOW + 1 + COUNT_BG_STARS;
+  const px = new Float32Array(total);
+  const py = new Float32Array(total);
+  const pz = new Float32Array(total);
+  const psize = new Float32Array(total);
+  const phue = new Float32Array(total);
+  const pbright = new Float32Array(total);
+  const ptype = new Uint8Array(total);
+  const pphase = new Float32Array(total);
+  const pspeed = new Float32Array(total);
+
+  // draw order indices (sort by depth)
+  const order = new Uint32Array(total);
+  for (let i = 0; i < total; i++) order[i] = i;
+
+  // small helpers
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const rand = (a, b) => a + Math.random() * (b - a);
+
+  function resize() {
+    DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    CW = Math.floor(W * DPR);
+    CH = Math.floor(H * DPR);
+
+    canvas.width = CW;
+    canvas.height = CH;
+
+    // glow downsample
+    GW = Math.max(320, Math.floor(W * Gscale));
+    GH = Math.max(320, Math.floor(H * Gscale));
+    glowCanvas.width = GW;
+    glowCanvas.height = GH;
+
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    gctx.setTransform(GW / W, 0, 0, GH / H, 0, 0);
+  }
+
+  // ==========
+  // Build scene
+  // ==========
+  function build() {
+    let idx = 0;
+
+    // ---- Tree body particles: elegant spiral cone (golden angle + height shaping)
+    // y in [-320..280] (top is negative for "up" in canvas coordinates later we flip)
+    for (let i = 0; i < COUNT_TREE; i++, idx++) {
+      ptype[idx] = 0;
+      const t = i / COUNT_TREE;
+
+      // Height: more density toward middle + bottom
+      const y = rand(-320, 260);
+      py[idx] = y;
+
+      // Radius grows with height (cone), with a slight "S" curve for elegance
+      const h01 = (y + 320) / 580; // 0(top) -> 1(bottom)
+      const maxR = 230;
+      const rBase = maxR * Math.pow(h01, 1.15);
+
+      // Even-ish distribution: golden angle spiral + random jitter
+      const ga = 2.3999632297; // golden angle
+      const theta = i * ga * 5.0 + rand(-0.25, 0.25);
+      const r = rBase * Math.sqrt(Math.random());
+
+      px[idx] = r * Math.cos(theta);
+      pz[idx] = r * Math.sin(theta);
+
+      // Size: small needles
+      psize[idx] = rand(0.8, 1.45);
+
+      // Holographic hue: teal->green->cyan with subtle variation
+      phue[idx] = 160 + 40 * Math.sin(h01 * Math.PI) + rand(-8, 8);
+      pbright[idx] = 0.45 + 0.4 * (1 - h01) + rand(-0.05, 0.05);
+
+      pphase[idx] = rand(0, Math.PI * 2);
+      pspeed[idx] = rand(0.5, 1.2);
+    }
+
+    // ---- Lights: distributed on outer shell (brighter, bigger, bloom)
+    for (let i = 0; i < COUNT_LIGHTS; i++, idx++) {
+      ptype[idx] = 1;
+
+      const y = rand(-300, 220);
+      py[idx] = y;
+      const h01 = (y + 320) / 580;
+
+      const maxR = 235;
+      const r = maxR * Math.pow(h01, 1.12) * rand(0.78, 1.02); // mostly on surface
+      const theta = rand(0, Math.PI * 2);
+
+      px[idx] = r * Math.cos(theta);
+      pz[idx] = r * Math.sin(theta);
+
+      psize[idx] = rand(2.0, 3.4);
+
+      // candy colors but still "holographic"
+      const palette = [10, 45, 190, 280, 155]; // red, gold, blue, magenta, green
+      phue[idx] = palette[(Math.random() * palette.length) | 0] + rand(-8, 8);
+      pbright[idx] = rand(0.85, 1.25);
+
+      pphase[idx] = rand(0, Math.PI * 2);
+      pspeed[idx] = rand(1.8, 3.6);
+    }
+
+    // ---- Snow: huge volume around
+    for (let i = 0; i < COUNT_SNOW; i++, idx++) {
+      ptype[idx] = 2;
+      px[idx] = rand(-1600, 1600);
+      py[idx] = rand(-1300, 1300);
+      pz[idx] = rand(-1600, 1600);
+      psize[idx] = rand(0.8, 2.2);
+      phue[idx] = rand(170, 220);
+      pbright[idx] = rand(0.15, 0.35);
+      pphase[idx] = rand(0, Math.PI * 2);
+      pspeed[idx] = rand(0.7, 1.8);
+    }
+
+    // ---- Star on top
+    ptype[idx] = 3;
+    px[idx] = 0; py[idx] = -345; pz[idx] = 0;
+    psize[idx] = 11.5;
+    phue[idx] = 48;
+    pbright[idx] = 1.15;
+    pphase[idx] = rand(0, Math.PI * 2);
+    pspeed[idx] = 2.6;
+    idx++;
+
+    // ---- Background stars
+    for (let i = 0; i < COUNT_BG_STARS; i++, idx++) {
+      ptype[idx] = 4;
+      px[idx] = rand(-2200, 2200);
+      py[idx] = rand(-1700, 1200);
+      pz[idx] = rand(-2400, -900); // always "far"
+      psize[idx] = rand(0.6, 1.8);
+      phue[idx] = rand(180, 240);
+      pbright[idx] = rand(0.08, 0.22);
+      pphase[idx] = rand(0, Math.PI * 2);
+      pspeed[idx] = rand(0.2, 0.6);
+    }
+  }
+
+  // ==========
+  // Rendering
+  // ==========
+  function drawBackground(t) {
+    // subtle nebula haze
+    const grad = ctx.createRadialGradient(W * 0.5, H * 0.35, 0, W * 0.5, H * 0.35, Math.max(W, H));
+    grad.addColorStop(0, "rgba(60,120,160,.22)");
+    grad.addColorStop(0.35, "rgba(20,40,70,.10)");
+    grad.addColorStop(0.75, "rgba(0,0,0,.55)");
+    grad.addColorStop(1, "rgba(0,0,0,1)");
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+
+    // faint vignette
+    ctx.globalAlpha = 0.55;
+    ctx.fillStyle = "rgba(0,0,0,.55)";
+    ctx.beginPath();
+    ctx.rect(0,0,W,H);
+    ctx.fill();
+
+    // time shimmer band (very subtle)
+    ctx.globalAlpha = 0.08;
+    ctx.fillStyle = "rgba(180,230,255,.5)";
+    const bandY = H * (0.15 + 0.05 * Math.sin(t * 0.35));
+    ctx.fillRect(0, bandY, W, 2);
+    ctx.globalAlpha = 1;
+  }
+
+  function projectAndSort(t) {
+    // Rotation matrix from yaw/pitch
+    const cy = Math.cos(yaw), sy = Math.sin(yaw);
+    const cx = Math.cos(pitch), sx = Math.sin(pitch);
+
+    // Camera parameters
+    const fov = (W < 650 ? 680 : 860) * zoom;
+    const zBias = 980; // push scene away
+    const centerX = W * 0.5;
+    const centerY = H * 0.5 - 22; // lift a bit for UI card space
+
+    // cache into temporary arrays for sorting + drawing
+    // (store into JS arrays for flexibility; still cheap enough)
+    if (!projectAndSort._x2d) {
+      projectAndSort._x2d = new Float32Array(total);
+      projectAndSort._y2d = new Float32Array(total);
+      projectAndSort._s = new Float32Array(total);
+      projectAndSort._z = new Float32Array(total);
+    }
+    const x2d = projectAndSort._x2d;
+    const y2d = projectAndSort._y2d;
+    const s = projectAndSort._s;
+    const zcam = projectAndSort._z;
+
+    for (let i = 0; i < total; i++) {
+      // apply yaw
+      const x0 = px[i] * cy - pz[i] * sy;
+      const z0 = pz[i] * cy + px[i] * sy;
+
+      // apply pitch
+      const y1 = py[i] * cx - z0 * sx;
+      const z1 = z0 * cx + py[i] * sx;
+
+      const z = z1 + zBias;
+      zcam[i] = z;
+
+      // perspective
+      const sc = fov / (fov + z);
+      s[i] = sc;
+      x2d[i] = x0 * sc + centerX;
+      y2d[i] = y1 * sc + centerY;
+    }
+
+    // depth sort (far -> near) for correct alpha layering
+    // small optimization: sort every frame is ok ~ 2-3k elements
+    orderSortByZ(order, zcam);
+
+    return { x2d, y2d, s, zcam };
+  }
+
+  // Fast-ish sort: JS sort on small arrays is fine, but we keep typed order[] and use Array.from.
+  // A custom quicksort on Uint32Array avoids allocations.
+  function orderSortByZ(arr, z) {
+    quickSort(arr, 0, arr.length - 1, z);
+  }
+  function quickSort(a, lo, hi, z) {
+    while (lo < hi) {
+      let i = lo, j = hi;
+      const pivot = z[a[(lo + hi) >>> 1]];
+      while (i <= j) {
+        while (z[a[i]] > pivot) i++;
+        while (z[a[j]] < pivot) j--;
+        if (i <= j) {
+          const tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+          i++; j--;
+        }
+      }
+      // tail recursion elim
+      if (j - lo < hi - i) {
+        if (lo < j) quickSort(a, lo, j, z);
+        lo = i;
+      } else {
+        if (i < hi) quickSort(a, i, hi, z);
+        hi = j;
+      }
+    }
+  }
+
+  function render(t) {
+    // auto motion (when not dragging)
+    if (!dragging) {
+      yaw += yawVel;
+      yawVel *= 0.995;
+      pitch += pitchVel;
+      pitchVel *= 0.94;
+      pitch *= 0.985;
+    }
+    pitch = clamp(pitch, -0.95, 0.55);
+
+    // snow drift + slight camera breathing
+    const breathe = 0.06 * Math.sin(t * 0.55);
+    const savedYaw = yaw;
+    yaw += breathe * 0.18;
+
+    // update snow
+    for (let i = COUNT_TREE + COUNT_LIGHTS; i < COUNT_TREE + COUNT_LIGHTS + COUNT_SNOW; i++) {
+      py[i] += pspeed[i] * 2.0;
+      px[i] += Math.sin(t * 0.6 + pphase[i]) * 0.18;
+      if (py[i] > 1400) py[i] = -1400;
+    }
+
+    // background stars twinkle (keep far)
+    const bgStart = COUNT_TREE + COUNT_LIGHTS + COUNT_SNOW + 1;
+    for (let i = bgStart; i < total; i++) {
+      // small parallax shimmer
+      px[i] += Math.sin(t * 0.2 + pphase[i]) * 0.02;
+    }
+
+    // clear both
+    ctx.clearRect(0, 0, W, H);
+    gctx.clearRect(0, 0, W, H);
+
+    drawBackground(t);
+
+    const { x2d, y2d, s, zcam } = projectAndSort(t);
+
+    // --- PASS 1: base layer (tree needles + snow + bg stars)
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 1;
+
+    // crisp stars on base
+    for (let k = 0; k < order.length; k++) {
+      const i = order[k];
+      const tp = ptype[i];
+      if (tp !== 4) continue;
+      const sc = s[i];
+      if (sc <= 0) continue;
+      const r = psize[i] * (0.75 + sc * 0.85);
+      const tw = 0.55 + 0.45 * Math.sin(t * 2.2 + pphase[i]);
+      ctx.globalAlpha = (pbright[i] * tw) * clamp(sc * 2.0, 0, 1);
+      ctx.fillStyle = `hsla(${phue[i]}, 70%, 85%, 1)`;
+      ctx.beginPath();
+      ctx.arc(x2d[i], y2d[i], r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // snow + tree needles
+    for (let k = 0; k < order.length; k++) {
+      const i = order[k];
+      const tp = ptype[i];
+      if (tp !== 0 && tp !== 2) continue;
+
+      const sc = s[i];
+      if (sc <= 0) continue;
+
+      // distance fade
+      const distFade = clamp((sc - 0.18) / 0.82, 0, 1);
+
+      const flicker = 0.65 + 0.35 * Math.sin(t * pspeed[i] + pphase[i]);
+      const alpha = (tp === 0 ? 0.22 : 0.18) * distFade * (0.65 + 0.35 * flicker);
+
+      // holographic depth shading
+      const depthL = clamp((sc - 0.25) * 1.6, 0.08, 1);
+      const lum = tp === 0 ? (35 + 38 * depthL) : (78 + 12 * depthL);
+      const sat = tp === 0 ? 85 : 35;
+
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = `hsla(${phue[i]}, ${sat}%, ${lum}%, 1)`;
+
+      const r = psize[i] * (tp === 0 ? 1.0 : 1.0) * (0.75 + sc * 1.2);
+
+      ctx.beginPath();
+      ctx.arc(x2d[i], y2d[i], r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // --- PASS 2: glow emitters (lights + top star) into glow buffer
+    gctx.globalCompositeOperation = "source-over";
+    for (let k = 0; k < order.length; k++) {
+      const i = order[k];
+      const tp = ptype[i];
+      if (tp !== 1 && tp !== 3) continue;
+
+      const sc = s[i];
+      if (sc <= 0) continue;
+
+      const blink = 0.62 + 0.38 * Math.sin(t * pspeed[i] + pphase[i]);
+      const alpha = (tp === 3 ? 0.95 : 0.72) * blink * clamp(sc * 1.8, 0, 1);
+
+      const r = psize[i] * (tp === 3 ? 1.35 : 1.0) * (0.65 + sc * 1.6);
+
+      gctx.globalAlpha = alpha;
+      gctx.fillStyle = `hsla(${phue[i]}, 95%, 62%, 1)`;
+      gctx.beginPath();
+      gctx.arc(x2d[i], y2d[i], r, 0, Math.PI * 2);
+      gctx.fill();
+    }
+
+    // blur glow (cheap bloom): draw glowCanvas onto itself with filter
+    // NOTE: filter works per draw call; we do a couple of passes for richer bloom.
+    const passes = (W < 650 ? 2 : 3);
+    for (let p = 0; p < passes; p++) {
+      gctx.globalAlpha = 0.72;
+      gctx.filter = `blur(${p === 0 ? 6 : 10}px)`;
+      gctx.globalCompositeOperation = "lighter";
+      gctx.drawImage(glowCanvas, 0, 0, W, H);
+    }
+    gctx.filter = "none";
+    gctx.globalAlpha = 1;
+
+    // composite glow onto main
+    ctx.globalCompositeOperation = "screen";
+    ctx.globalAlpha = 0.65;
+    ctx.drawImage(glowCanvas, 0, 0, W, H);
+
+    // --- PASS 3: crisp lights on top (additive)
+    ctx.globalCompositeOperation = "lighter";
+    for (let k = 0; k < order.length; k++) {
+      const i = order[k];
+      const tp = ptype[i];
+      if (tp !== 1 && tp !== 3) continue;
+
+      const sc = s[i];
+      if (sc <= 0) continue;
+
+      const blink = 0.6 + 0.4 * Math.sin(t * pspeed[i] + pphase[i]);
+      const alpha = (tp === 3 ? 0.95 : 0.65) * blink * clamp(sc * 1.9, 0, 1);
+
+      const r = psize[i] * (tp === 3 ? 1.05 : 0.75) * (0.8 + sc * 1.25);
+
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = `hsla(${phue[i]}, 100%, ${tp === 3 ? 70 : 62}%, 1)`;
+
+      ctx.beginPath();
+      ctx.arc(x2d[i], y2d[i], r, 0, Math.PI * 2);
+      ctx.fill();
+
+      // tiny sparkle cross (only for star top)
+      // if (tp === 3) {
+      //   ctx.globalAlpha = alpha * 0.55;
+      //   ctx.fillRect(x2d[i] - r * 1.9, y2d[i] - 0.8, r * 3.8, 1.6);
+      //   ctx.fillRect(x2d[i] - 0.8, y2d[i] - r * 1.9, 1.6, r * 3.8);
+      // }
+    }
+
+    // restore
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = "source-over";
+
+    // subtle chromatic shimmer (very tiny, “全息”味道)
+    // (cheap trick: 2 offset draws with low alpha)
+    ctx.globalAlpha = 0.05;
+    ctx.globalCompositeOperation = "lighter";
+    ctx.drawImage(canvas, -1, 0);
+    ctx.drawImage(canvas, 1, 0);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = "source-over";
+
+    yaw = savedYaw; // undo breathe offset
+  }
+
+  // ==========
+  // Interaction (mouse/touch + pinch zoom)
+  // ==========
+  function onDown(x, y) {
+    dragging = true;
+    lastX = x; lastY = y;
+  }
+  function onMove(x, y) {
+    if (!dragging) return;
+    const dx = x - lastX;
+    const dy = y - lastY;
+
+    yaw += dx * 0.006;
+    pitch += dy * 0.004;
+
+    yawVel = dx * 0.00035;
+    pitchVel = dy * 0.00018;
+
+    lastX = x; lastY = y;
+  }
+  function onUp() {
+    dragging = false;
+  }
+
+  let pinchDist = 0;
+  function dist(t0, t1){
+    const dx = t0.clientX - t1.clientX;
+    const dy = t0.clientY - t1.clientY;
+    return Math.hypot(dx, dy);
+  }
+
+  canvas.addEventListener('mousedown', (e) => onDown(e.clientX, e.clientY));
+  window.addEventListener('mousemove', (e) => onMove(e.clientX, e.clientY));
+  window.addEventListener('mouseup', onUp);
+
+  canvas.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    if (e.touches.length === 1) {
+      onDown(e.touches[0].clientX, e.touches[0].clientY);
+    } else if (e.touches.length === 2) {
+      pinchDist = dist(e.touches[0], e.touches[1]);
+    }
+  }, { passive:false });
+
+  window.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    if (e.touches.length === 1) {
+      onMove(e.touches[0].clientX, e.touches[0].clientY);
+    } else if (e.touches.length === 2) {
+      const d = dist(e.touches[0], e.touches[1]);
+      if (pinchDist > 0) {
+        const delta = (d - pinchDist) * 0.0025;
+        zoom = clamp(zoom + delta, 0.75, 1.35);
+      }
+      pinchDist = d;
+    }
+  }, { passive:false });
+
+  window.addEventListener('touchend', () => {
+    pinchDist = 0;
+    onUp();
+  });
+
+  // Wheel zoom (desktop)
+  window.addEventListener('wheel', (e) => {
+    const delta = -Math.sign(e.deltaY) * 0.03;
+    zoom = clamp(zoom + delta, 0.75, 1.35);
+  }, { passive:true });
+
+  // ==========
+  // Loop
+  // ==========
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+
+    // gentle auto spin baseline (if user stops, it slowly returns to elegant motion)
+    if (!dragging) {
+      yawVel = yawVel * inertia + 0.00035;
+    } else {
+      yawVel *= 0.98;
+    }
+
+    render(now / 1000);
+    requestAnimationFrame(loop);
+  }
+
+  // init
+  resize();
+  build();
+  requestAnimationFrame(loop);
+  window.addEventListener('resize', resize);
+})();
+</script>
+</body>
+</html>
