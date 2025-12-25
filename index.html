@@ -104,21 +104,20 @@
     </div>
   </div>
 
-    <!-- 添加背景音乐 -->
-  <audio id="background-music" autoplay loop>
+  <audio id="background-music" loop>
     <source src="https://ldincredible.github.io/Tata_tree/music/christmas-438153.mp3" type="audio/mp3">
     您的浏览器不支持音频元素。
   </audio>
-
-  <script>
-    // 当页面加载完成时，解除静音并播放
-    window.onload = function() {
-      const music = document.getElementById('background-music');
-      music.muted = false;  // 解除静音
-      music.play();
-    };
-  </script>
   
+  <button id="play-music-btn">点击播放音乐</button>
+  
+  <script>
+    document.getElementById('play-music-btn').addEventListener('click', function() {
+      const music = document.getElementById('background-music');
+      music.play();
+      this.style.display = 'none';  // 隐藏按钮
+    });
+  </script>
 <script>
 (() => {
   // ==========
