@@ -110,6 +110,15 @@
     您的浏览器不支持音频元素。
   </audio>
 
+  <script>
+    // 当页面加载完成时，解除静音并播放
+    window.onload = function() {
+      const music = document.getElementById('background-music');
+      music.muted = false;  // 解除静音
+      music.play();
+    };
+  </script>
+  
 <script>
 (() => {
   // ==========
